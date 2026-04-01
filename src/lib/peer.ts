@@ -19,7 +19,9 @@ const ICE_SERVERS: RTCConfiguration = {
   ],
 };
 
-const CHUNK_SIZE = 16384; // 16KB chunks
+const CHUNK_SIZE = 65536; // 64KB chunks (4x faster)
+const BUFFER_HIGH = 1048576; // 1MB buffer threshold
+const BUFFER_LOW = 262144; // 256KB low watermark
 
 // ── Hosted files (sender keeps in memory) ──
 const hostedFiles = new Map<string, ArrayBuffer>();
@@ -38,7 +40,7 @@ interface Signal {
   mediaId: string;
   from: string;
   to: string;
-  data: string; // JSON-stringified SDP or ICE candidate
+  data: string;
 }
 
 async function sendSignal(roomId: string, signal: Signal) {
@@ -50,7 +52,6 @@ async function sendSignal(roomId: string, signal: Signal) {
 const activeSenderListeners = new Map<string, () => void>();
 
 export function startHosting(roomId: string, userId: string) {
-  // Already listening
   if (activeSenderListeners.has(roomId)) return;
 
   const q = query(
@@ -90,28 +91,33 @@ async function handleIncomingRequest(
   const fileData: ArrayBuffer = maybeFile;
 
   const pc = new RTCPeerConnection(ICE_SERVERS);
-  const dc = pc.createDataChannel("file");
+  const dc = pc.createDataChannel("file", {
+    ordered: true,
+  });
+
+  dc.bufferedAmountLowThreshold = BUFFER_LOW;
+  dc.binaryType = "arraybuffer";
 
   dc.onopen = () => {
-    // Send file size first, then chunks
     dc.send(JSON.stringify({ size: fileData.byteLength }));
     let offset = 0;
-    function sendNextChunk() {
-      while (dc.bufferedAmount < 65536 && offset < fileData.byteLength) {
+
+    function drainBuffer() {
+      while (offset < fileData.byteLength && dc.bufferedAmount < BUFFER_HIGH) {
         const end = Math.min(offset + CHUNK_SIZE, fileData.byteLength);
         dc.send(fileData.slice(offset, end));
         offset = end;
       }
-      if (offset < fileData.byteLength) {
-        setTimeout(sendNextChunk, 10);
-      } else {
-        setTimeout(() => dc.close(), 500);
+      if (offset >= fileData.byteLength) {
+        setTimeout(() => dc.close(), 200);
       }
     }
-    sendNextChunk();
+
+    // Use bufferedamountlow event for backpressure — no polling
+    dc.onbufferedamountlow = drainBuffer;
+    drainBuffer();
   };
 
-  // ICE candidates → Firestore
   pc.onicecandidate = (e) => {
     if (e.candidate) {
       sendSignal(roomId, {
@@ -124,7 +130,6 @@ async function handleIncomingRequest(
     }
   };
 
-  // Set remote offer and create answer
   await pc.setRemoteDescription(JSON.parse(signal.data));
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
@@ -137,7 +142,6 @@ async function handleIncomingRequest(
     data: JSON.stringify(answer),
   });
 
-  // Listen for ICE from receiver
   const iceQ = query(
     collection(db, "rooms", roomId, "signals"),
     where("to", "==", userId),
@@ -200,7 +204,6 @@ export function requestFile(
 
     dc.onclose = () => {
       if (received >= totalSize && totalSize > 0) {
-        // Combine chunks
         const result = new Uint8Array(totalSize);
         let offset = 0;
         for (const chunk of chunks) {
@@ -218,7 +221,6 @@ export function requestFile(
     };
   };
 
-  // ICE candidates → Firestore
   pc.onicecandidate = (e) => {
     if (e.candidate) {
       sendSignal(roomId, {
@@ -231,7 +233,6 @@ export function requestFile(
     }
   };
 
-  // Listen for answer from sender
   const ansQ = query(
     collection(db, "rooms", roomId, "signals"),
     where("to", "==", myUserId),
@@ -249,7 +250,6 @@ export function requestFile(
     });
   });
 
-  // Listen for ICE from sender
   const iceQ = query(
     collection(db, "rooms", roomId, "signals"),
     where("to", "==", myUserId),
@@ -273,7 +273,6 @@ export function requestFile(
     pc.close();
   }
 
-  // Create offer and send to sender
   pc.createOffer().then(async (offer) => {
     await pc.setLocalDescription(offer);
     await sendSignal(roomId, {
@@ -285,7 +284,6 @@ export function requestFile(
     });
   });
 
-  // Timeout after 15s
   setTimeout(() => {
     if (received === 0) {
       onError("Sender is offline");
