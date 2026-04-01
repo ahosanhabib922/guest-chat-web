@@ -27,6 +27,9 @@ export const TTL_OPTIONS = [
   { label: "24 hours", value: 1440 },
 ] as const;
 
+// Max file size: 5MB (after base64 + encryption, fits in Firestore chunks)
+export const MAX_FILE_SIZE = 5 * 1024 * 1024;
+
 export interface Message {
   id: string;
   text: string;
@@ -35,11 +38,11 @@ export interface Message {
   senderAvatar: string;
   timestamp: Timestamp | null;
   edited?: boolean;
-  // Media fields (only present for media messages)
-  mediaId?: string;
   mediaName?: string;
-  mediaType?: string; // MIME type
+  mediaType?: string;
   mediaSize?: number;
+  encMediaData?: string; // encrypted base64 file data (inline for small files)
+  mediaChunks?: number;  // number of chunks (for large files)
 }
 
 interface RawMessage {
@@ -50,10 +53,11 @@ interface RawMessage {
   senderId: string;
   timestamp: Timestamp | null;
   edited?: boolean;
-  mediaId?: string;
   encMediaName?: string;
   mediaType?: string;
   mediaSize?: number;
+  encMediaData?: string;
+  mediaChunks?: number;
 }
 
 export function generateRoomCode(): string {
@@ -63,10 +67,6 @@ export function generateRoomCode(): string {
     code += chars.charAt(Math.floor(Math.random() * chars.length));
   }
   return code;
-}
-
-export function generateMediaId(): string {
-  return `media-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 export async function getAnonymousUser(): Promise<string> {
@@ -92,7 +92,6 @@ export async function getRoomInfo(
   return snap.data() as { createdAt: Timestamp; ttlMinutes: number };
 }
 
-// Send a text message (encrypted)
 export async function sendMessage(
   roomId: string,
   text: string,
@@ -112,32 +111,127 @@ export async function sendMessage(
   });
 }
 
-// Send a media message (metadata only — file stays with sender)
+// Convert ArrayBuffer to base64 string
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+// Convert base64 string to ArrayBuffer
+export function base64ToArrayBuffer(base64: string): ArrayBuffer {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer as ArrayBuffer;
+}
+
+// Firestore doc limit ~1MB. Keep chunk data under 800KB to be safe.
+const CHUNK_MAX = 800000;
+
+// Send media message — encrypt file data and store in Firestore
 export async function sendMediaMessage(
   roomId: string,
   senderId: string,
   senderName: string,
   senderAvatar: string,
   encryptionKey: string,
-  mediaId: string,
   mediaName: string,
   mediaType: string,
-  mediaSize: number
+  fileData: ArrayBuffer
 ): Promise<void> {
   const encName = await encrypt(senderName, encryptionKey);
   const encMediaName = await encrypt(mediaName, encryptionKey);
   const encText = await encrypt(`📎 ${mediaName}`, encryptionKey);
-  await addDoc(collection(db, "rooms", roomId, "messages"), {
-    encText,
-    encName,
-    senderAvatar,
-    senderId,
-    mediaId,
-    encMediaName,
-    mediaType,
-    mediaSize,
-    timestamp: serverTimestamp(),
-  });
+
+  // Convert file to base64, then encrypt
+  const base64Data = arrayBufferToBase64(fileData);
+  const encMediaData = await encrypt(base64Data, encryptionKey);
+
+  if (encMediaData.length <= CHUNK_MAX) {
+    // Small file — store inline
+    await addDoc(collection(db, "rooms", roomId, "messages"), {
+      encText,
+      encName,
+      senderAvatar,
+      senderId,
+      encMediaName,
+      mediaType,
+      mediaSize: fileData.byteLength,
+      encMediaData,
+      timestamp: serverTimestamp(),
+    });
+  } else {
+    // Large file — store in chunks subcollection
+    const chunks = Math.ceil(encMediaData.length / CHUNK_MAX);
+    const msgRef = await addDoc(collection(db, "rooms", roomId, "messages"), {
+      encText,
+      encName,
+      senderAvatar,
+      senderId,
+      encMediaName,
+      mediaType,
+      mediaSize: fileData.byteLength,
+      mediaChunks: chunks,
+      timestamp: serverTimestamp(),
+    });
+
+    // Write chunks in parallel
+    const chunkPromises = [];
+    for (let i = 0; i < chunks; i++) {
+      const start = i * CHUNK_MAX;
+      const end = Math.min(start + CHUNK_MAX, encMediaData.length);
+      chunkPromises.push(
+        setDoc(
+          doc(db, "rooms", roomId, "messages", msgRef.id, "chunks", String(i)),
+          { data: encMediaData.slice(start, end) }
+        )
+      );
+    }
+    await Promise.all(chunkPromises);
+  }
+}
+
+// Load media data for a message (handles both inline and chunked)
+export async function loadMediaData(
+  roomId: string,
+  messageId: string,
+  encMediaData: string | undefined,
+  mediaChunks: number | undefined,
+  encryptionKey: string
+): Promise<ArrayBuffer | null> {
+  try {
+    let fullEncData: string;
+
+    if (encMediaData) {
+      fullEncData = encMediaData;
+    } else if (mediaChunks && mediaChunks > 0) {
+      // Load chunks
+      const parts: string[] = [];
+      for (let i = 0; i < mediaChunks; i++) {
+        const chunkSnap = await getDoc(
+          doc(db, "rooms", roomId, "messages", messageId, "chunks", String(i))
+        );
+        if (chunkSnap.exists()) {
+          parts.push(chunkSnap.data().data as string);
+        }
+      }
+      fullEncData = parts.join("");
+    } else {
+      return null;
+    }
+
+    const base64Data = await decrypt(fullEncData, encryptionKey);
+    if (base64Data === "[Decryption failed]") return null;
+    return base64ToArrayBuffer(base64Data);
+  } catch {
+    return null;
+  }
 }
 
 export async function editMessage(
@@ -157,6 +251,11 @@ export async function deleteMessage(
   roomId: string,
   messageId: string
 ): Promise<void> {
+  // Delete chunks if any
+  const chunksRef = collection(db, "rooms", roomId, "messages", messageId, "chunks");
+  const chunksSnap = await getDocs(chunksRef);
+  await Promise.all(chunksSnap.docs.map((d) => deleteDoc(d.ref)));
+  // Delete message
   await deleteDoc(doc(db, "rooms", roomId, "messages", messageId));
 }
 
@@ -187,13 +286,14 @@ export function subscribeToMessages(
           timestamp: raw.timestamp,
           edited: raw.edited,
         };
-        if (raw.mediaId) {
-          msg.mediaId = raw.mediaId;
+        if (raw.encMediaName || raw.encMediaData || raw.mediaChunks) {
           msg.mediaName = raw.encMediaName
             ? await decrypt(raw.encMediaName, encryptionKey)
             : undefined;
           msg.mediaType = raw.mediaType;
           msg.mediaSize = raw.mediaSize;
+          msg.encMediaData = raw.encMediaData;
+          msg.mediaChunks = raw.mediaChunks;
         }
         return msg;
       })
@@ -204,16 +304,14 @@ export function subscribeToMessages(
 }
 
 export async function deleteRoom(roomId: string): Promise<void> {
-  // Delete messages
   const messagesRef = collection(db, "rooms", roomId, "messages");
   const msgSnap = await getDocs(messagesRef);
+  for (const msgDoc of msgSnap.docs) {
+    // Delete chunks
+    const chunksRef = collection(db, "rooms", roomId, "messages", msgDoc.id, "chunks");
+    const chunksSnap = await getDocs(chunksRef);
+    await Promise.all(chunksSnap.docs.map((d) => deleteDoc(d.ref)));
+  }
   await Promise.all(msgSnap.docs.map((d) => deleteDoc(d.ref)));
-
-  // Delete signals
-  const signalsRef = collection(db, "rooms", roomId, "signals");
-  const sigSnap = await getDocs(signalsRef);
-  await Promise.all(sigSnap.docs.map((d) => deleteDoc(d.ref)));
-
-  // Delete room
   await deleteDoc(doc(db, "rooms", roomId));
 }
