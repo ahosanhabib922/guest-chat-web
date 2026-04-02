@@ -12,6 +12,7 @@ import {
   subscribeToMessages,
   deleteRoom,
   getRoomInfo,
+  setRoomExpiresAt,
   MAX_FILE_SIZE,
   Message,
 } from "@/lib/chat";
@@ -66,6 +67,9 @@ export default function ChatRoom() {
       const room = await getRoomInfo(roomId);
       if (room?.createdAt && room?.ttlMinutes) {
         expiresAtRef.current = room.createdAt.toMillis() + room.ttlMinutes * 60 * 1000;
+      }
+      if (room?.expiresAt) {
+        setRoomExpiresAt(room.expiresAt);
       }
 
       unsubscribe = subscribeToMessages(roomId, hash, setMessages);

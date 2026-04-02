@@ -12,6 +12,7 @@ import {
   setDoc,
   updateDoc,
   Timestamp,
+  where,
 } from "firebase/firestore";
 import { signInAnonymously } from "firebase/auth";
 import { db, auth } from "./firebase";
@@ -78,18 +79,32 @@ export async function createRoom(
   roomId: string,
   ttlMinutes: number
 ): Promise<void> {
+  const expiresAt = Timestamp.fromMillis(Date.now() + ttlMinutes * 60 * 1000);
   await setDoc(doc(db, "rooms", roomId), {
     createdAt: serverTimestamp(),
     ttlMinutes,
+    expiresAt,
   });
 }
 
 export async function getRoomInfo(
   roomId: string
-): Promise<{ createdAt: Timestamp; ttlMinutes: number } | null> {
+): Promise<{ createdAt: Timestamp; ttlMinutes: number; expiresAt: Timestamp } | null> {
   const snap = await getDoc(doc(db, "rooms", roomId));
   if (!snap.exists()) return null;
-  return snap.data() as { createdAt: Timestamp; ttlMinutes: number };
+  return snap.data() as { createdAt: Timestamp; ttlMinutes: number; expiresAt: Timestamp };
+}
+
+// Cache room expiresAt for attaching to messages
+let _roomExpiresAt: Timestamp | null = null;
+
+export function setRoomExpiresAt(ts: Timestamp) {
+  _roomExpiresAt = ts;
+}
+
+function getExpiresAt(): Timestamp {
+  // Fallback: 1 hour from now if not set
+  return _roomExpiresAt || Timestamp.fromMillis(Date.now() + 60 * 60 * 1000);
 }
 
 export async function sendMessage(
@@ -108,6 +123,7 @@ export async function sendMessage(
     senderAvatar,
     senderId,
     timestamp: serverTimestamp(),
+    expiresAt: getExpiresAt(),
   });
 }
 
@@ -153,6 +169,8 @@ export async function sendMediaMessage(
   const base64Data = arrayBufferToBase64(fileData);
   const encMediaData = await encrypt(base64Data, encryptionKey);
 
+  const expiry = getExpiresAt();
+
   if (encMediaData.length <= CHUNK_MAX) {
     // Small file — store inline
     await addDoc(collection(db, "rooms", roomId, "messages"), {
@@ -165,6 +183,7 @@ export async function sendMediaMessage(
       mediaSize: fileData.byteLength,
       encMediaData,
       timestamp: serverTimestamp(),
+      expiresAt: expiry,
     });
   } else {
     // Large file — store in chunks subcollection
@@ -179,6 +198,7 @@ export async function sendMediaMessage(
       mediaSize: fileData.byteLength,
       mediaChunks: chunks,
       timestamp: serverTimestamp(),
+      expiresAt: expiry,
     });
 
     // Write chunks in parallel
@@ -189,7 +209,7 @@ export async function sendMediaMessage(
       chunkPromises.push(
         setDoc(
           doc(db, "rooms", roomId, "messages", msgRef.id, "chunks", String(i)),
-          { data: encMediaData.slice(start, end) }
+          { data: encMediaData.slice(start, end), expiresAt: expiry }
         )
       );
     }
