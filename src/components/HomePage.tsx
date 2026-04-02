@@ -1,17 +1,22 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   generateRoomCode,
   createRoom,
   getAnonymousUser,
+  cleanupExpiredRooms,
   AVATARS,
   TTL_OPTIONS,
 } from "@/lib/chat";
 import { generateEncryptionKey } from "@/lib/crypto";
 
 export default function HomePage() {
+  // Clean up expired rooms on every home page visit
+  useEffect(() => {
+    cleanupExpiredRooms();
+  }, []);
   const router = useRouter();
   const [joinLink, setJoinLink] = useState("");
   const [name, setName] = useState("");

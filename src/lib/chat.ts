@@ -327,11 +327,26 @@ export async function deleteRoom(roomId: string): Promise<void> {
   const messagesRef = collection(db, "rooms", roomId, "messages");
   const msgSnap = await getDocs(messagesRef);
   for (const msgDoc of msgSnap.docs) {
-    // Delete chunks
     const chunksRef = collection(db, "rooms", roomId, "messages", msgDoc.id, "chunks");
     const chunksSnap = await getDocs(chunksRef);
     await Promise.all(chunksSnap.docs.map((d) => deleteDoc(d.ref)));
   }
   await Promise.all(msgSnap.docs.map((d) => deleteDoc(d.ref)));
   await deleteDoc(doc(db, "rooms", roomId));
+}
+
+// Clean up all expired rooms — runs on every app/page load
+export async function cleanupExpiredRooms(): Promise<void> {
+  try {
+    const now = Timestamp.now();
+    const q = query(
+      collection(db, "rooms"),
+      where("expiresAt", "<=", now)
+    );
+    const snapshot = await getDocs(q);
+    const deletions = snapshot.docs.map((d) => deleteRoom(d.id));
+    await Promise.all(deletions);
+  } catch {
+    // Silently ignore — cleanup is best-effort
+  }
 }
